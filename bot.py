@@ -1,5 +1,9 @@
 import logging
 import os
+import time
+from dotenv import load_dotenv
+from datetime import datetime
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -19,18 +23,115 @@ from telegram.ext import (
 )
 from telegram.helpers import mention_html
 
+import psycopg2
+
+load_dotenv()
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SUPPORT_GROUP_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-SUPPORT_GROUP_ID = os.getenv("SUPPORT_GROUP_ID")
-
-SUPPORT_TEAM_IDS = os.getenv("SUPPORT_TEAM_IDS")
+SUPPORT_TEAM_IDS = [600911552, 1185876314, 706145083]
 
 support_message_map = {}
-
 user_language = {}
 user_state = {}
-
 user_messages = {}
+
+last_seen_created_at = None
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+def get_db_connection():
+    """Returns a new psycopg2 connection using DATABASE_URL."""
+    return psycopg2.connect(DATABASE_URL)
+
+def init_last_seen_created_at():
+    """
+    On first run, set last_seen_created_at to the max createdAt
+    in the Order table so we don't spam old orders.
+    """
+    global last_seen_created_at
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT MAX("createdAt") FROM "Order"')
+        row = cur.fetchone()
+        if row and row[0]:
+            last_seen_created_at = row[0]
+            logger.info(f"[DB Polling] Initial last_seen_created_at set to {last_seen_created_at}")
+        else:
+            logger.info("[DB Polling] No existing orders, starting fresh.")
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"init_last_seen_created_at error: {e}", exc_info=True)
+
+async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Periodically checks for new orders in DB. Any new rows get posted 
+    to SUPPORT_GROUP_ID with order details.
+    """
+    global last_seen_created_at
+    if last_seen_created_at is None:
+        init_last_seen_created_at()
+        return
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        query = '''
+            SELECT "id", "orderNumber", "firstName", "lastName",
+                   "email", "phone", "address", "shippingMethod",
+                   "subtotal", "total", "status", "createdAt", "coupons"
+            FROM "Order"
+            WHERE "createdAt" > %s
+            ORDER BY "createdAt" ASC
+        '''
+        cur.execute(query, (last_seen_created_at,))
+        rows = cur.fetchall()
+        col_names = [desc[0] for desc in cur.description]
+
+        if rows:
+            logger.info(f"[DB Polling] Found {len(rows)} new order(s).")
+
+        for row in rows:
+            row_dict = dict(zip(col_names, row))
+            message_text = (
+                f"🆕 <b>New Order #{row_dict['orderNumber']}</b>\n"
+                f"<b>Name:</b> {row_dict['firstName']} {row_dict['lastName']}\n"
+                f"<b>Email:</b> {row_dict['email']}\n"
+                f"<b>Phone:</b> {row_dict['phone']}\n"
+                f"<b>Address:</b> {row_dict['address']}\n"
+                f"<b>Shipping:</b> {row_dict['shippingMethod']}\n"
+                f"<b>Subtotal:</b> {row_dict['subtotal']}\n"
+                f"<b>Total:</b> {row_dict['total']}\n"
+                f"<b>Status:</b> {row_dict['status']}\n"
+                f"<b>Date:</b> {row_dict['createdAt']}\n"
+            )
+            coupons_value = row_dict.get("coupons")
+            coupons_str = ""
+            if coupons_value:
+                if isinstance(coupons_value, list):
+                    coupons_str = ", ".join(coupons_value)
+                else:
+                    coupons_str = str(coupons_value)
+            message_text += f"<b>Coupons:</b> {coupons_str}\n"
+
+            await context.bot.send_message(
+                chat_id=SUPPORT_GROUP_ID,
+                text=message_text,
+                parse_mode=ParseMode.HTML
+            )
+            last_seen_created_at = row_dict["createdAt"]
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"[DB Polling] check_new_orders error: {e}", exc_info=True)
 
 async def send_start_message(update: Update, context: ContextTypes.DEFAULT_TYPE, lang="ru"):
     user = update.effective_user
@@ -80,19 +181,12 @@ async def send_start_message(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if update.message:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
-        await update.message.reply_text(
-            quick_access_text, reply_markup=custom_reply_markup
-        )
+        await update.message.reply_text(quick_access_text, reply_markup=custom_reply_markup)
     elif update.callback_query:
-        await update.callback_query.message.reply_text(
-            message_text, reply_markup=reply_markup
-        )
-        await update.callback_query.message.reply_text(
-            quick_access_text, reply_markup=custom_reply_markup
-        )
+        await update.callback_query.message.reply_text(message_text, reply_markup=reply_markup)
+        await update.callback_query.message.reply_text(quick_access_text, reply_markup=custom_reply_markup)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command."""
     user_language[update.effective_user.id] = "ru"
     await send_start_message(update, context, "ru")
 
@@ -106,9 +200,7 @@ async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_text = "Чтобы обратиться в службу поддержки, нажмите кнопку ниже."
         button_text = "Отправить сообщение в поддержку"
 
-    button = [
-        [InlineKeyboardButton(button_text, callback_data="send_support_request")]
-    ]
+    button = [[InlineKeyboardButton(button_text, callback_data="send_support_request")]]
     reply_markup = InlineKeyboardMarkup(button)
 
     if update.callback_query:
@@ -169,7 +261,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await prompt_support_message(update, context)
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming text and photo messages from users and forwards them to the support group."""
+    """Handles incoming text/photo from private chat, forwards to support group."""
     user = update.effective_user
     message = update.message
 
@@ -185,12 +277,12 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if lang == "en":
                 await message.reply_text("Please send text or photo messages for support.")
             else:
-                await message.reply_text("Пожалуйста, отправьте текстовое сообщение или фотографию для поддержки.")
+                await message.reply_text("Пожалуйста, отправьте текст или фото для поддержки.")
             return
 
         try:
             user_mention = mention_html(user.id, user.first_name or "User")
-            support_message_text = f"📩 <b>New Support Request</b>\n\n"
+            support_message_text = "📩 <b>New Support Request</b>\n\n"
             support_message_text += f"<b>From:</b> {user_mention}"
             if user.username:
                 support_message_text += f" (@{user.username})"
@@ -217,35 +309,23 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             user_state[user_id] = None
             if lang == "en":
-                await message.reply_text(
-                    "✅ Your message has been forwarded to our support team. We'll get back to you shortly."
-                )
+                await message.reply_text("✅ Your message has been forwarded to our support team.")
             else:
-                await message.reply_text(
-                    "✅ Ваше сообщение было отправлено в поддержку. Мы свяжемся с вами в ближайшее время."
-                )
-
+                await message.reply_text("✅ Ваше сообщение было отправлено в поддержку.")
         except Exception as e:
+            logger.error("Error forwarding support message:", exc_info=e)
             if lang == "en":
-                await message.reply_text(
-                    "❌ Failed to forward your message. Please try again later."
-                )
+                await message.reply_text("❌ Failed to forward your message. Please try again later.")
             else:
-                await message.reply_text(
-                    "❌ Не удалось отправить ваше сообщение. Пожалуйста, попробуйте позже."
-                )
+                await message.reply_text("❌ Не удалось отправить ваше сообщение. Пожалуйста, попробуйте позже.")
     else:
         if lang == "en":
-            await message.reply_text(
-                "Please use the /support command or press the Support button to send a message to support."
-            )
+            await message.reply_text("Use /support or the Support button to send a message.")
         else:
-            await message.reply_text(
-                "Пожалуйста, используйте команду /support или нажмите кнопку «Поддержка», чтобы отправить сообщение в поддержку."
-            )
+            await message.reply_text("Используйте /support или кнопку «Поддержка» для отправки сообщения.")
 
 async def handle_support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles replies from the support group and sends them back to the respective users."""
+    """Handles replies from the support group -> sends back to user in private chat."""
     message = update.message
     support_user = message.from_user
 
@@ -257,19 +337,13 @@ async def handle_support_reply(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if not message.reply_to_message:
-        await message.reply_text(
-            "❌ Please reply to a specific support request message."
-        )
+        await message.reply_text("❌ Please reply to a specific support request message.")
         return
 
     original_message = message.reply_to_message
-
     user_id = support_message_map.get(original_message.message_id)
-
     if not user_id:
-        await message.reply_text(
-            "❌ Could not find the original user for this message."
-        )
+        await message.reply_text("❌ Could not find the original user for this message.")
         return
 
     lang = user_language.get(user_id, "ru")
@@ -301,12 +375,12 @@ async def handle_support_reply(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await message.reply_text("✅ Reply sent to the user.")
     except Exception as e:
+        logger.error("Error sending reply to user:", exc_info=e)
         await message.reply_text("❌ Failed to send the reply to the user.")
 
 async def list_support_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lists all active support sessions."""
+    """Lists all active support sessions (message_id -> user_id)."""
     support_user = update.effective_user
-
     if support_user.id not in SUPPORT_TEAM_IDS:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
@@ -331,7 +405,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Неизвестная команда. Пожалуйста, используйте /start для начала.")
 
 def main():
-    """Starts the bot."""
+    """Starts the bot with DB polling and support reply logic."""
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -350,17 +424,18 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            (filters.Chat(SUPPORT_GROUP_ID))
-            & (filters.TEXT | filters.PHOTO)
-            & filters.REPLY,
+            (filters.Chat(SUPPORT_GROUP_ID)) & (filters.TEXT | filters.PHOTO) & filters.REPLY,
             handle_support_reply,
         )
     )
 
-    application.add_handler(
-        MessageHandler(filters.COMMAND, unknown_command)
-    ) 
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
+    init_last_seen_created_at()
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_new_orders, interval=10, first=5)
+
+    logger.info("Bot is starting. Press Ctrl+C to stop.")
     application.run_polling()
 
 if __name__ == "__main__":
