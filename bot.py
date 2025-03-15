@@ -13,7 +13,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPPORT_GROUP_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
-SUPPORT_TEAM_IDS = [600911552, 1185876314, 706145083]
+SUPPORT_TEAM_IDS_STR = os.environ.get('SUPPORT_TEAM_IDS', '')
+SUPPORT_TEAM_IDS = [int(id) for id in SUPPORT_TEAM_IDS_STR.split(',') if id.strip()]
 support_message_map = {}
 user_language = {}
 user_state = {}
